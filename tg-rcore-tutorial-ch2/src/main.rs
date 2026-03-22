@@ -43,6 +43,10 @@ use tg_sbi;
 // 系统调用相关：调用者信息、系统调用 ID
 use tg_syscall::{Caller, SyscallId};
 
+#[cfg(target_arch = "riscv64")]
+mod alloc;
+mod render;
+
 // ========== 启动相关 ==========
 
 // 将用户程序的二进制数据内联到内核镜像的 .data 段中
@@ -92,6 +96,7 @@ extern "C" fn rust_main() -> ! {
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let app_base = app.as_ptr() as usize;
         log::info!("load app{i} to {app_base:#x}");
+        render::render_piece_from_app_index(i);
 
         // 创建用户态上下文，入口地址为 app_base
         // LocalContext::user() 会设置 sstatus.SPP = User，
@@ -99,8 +104,7 @@ extern "C" fn rust_main() -> ! {
         let mut ctx = LocalContext::user(app_base);
 
         // 分配用户栈（4 KiB），使用 MaybeUninit 避免不必要的零初始化
-        let mut user_stack: core::mem::MaybeUninit<[usize; 512]> =
-            core::mem::MaybeUninit::uninit();
+        let mut user_stack: core::mem::MaybeUninit<[usize; 512]> = core::mem::MaybeUninit::uninit();
         let user_stack_ptr = user_stack.as_mut_ptr() as *mut usize;
         // 将用户栈顶地址写入上下文的 sp 寄存器
         *ctx.sp_mut() = unsafe { user_stack_ptr.add(512) } as usize;
@@ -120,7 +124,7 @@ extern "C" fn rust_main() -> ! {
                 Trap::Exception(Exception::UserEnvCall) => {
                     use SyscallResult::*;
                     match handle_syscall(&mut ctx) {
-                        Done => continue,           // 系统调用处理完成，继续执行
+                        Done => continue, // 系统调用处理完成，继续执行
                         Exit(code) => log::info!("app{i} exit with code {code}"),
                         Error(id) => {
                             log::error!("app{i} call an unsupported syscall {}", id.0)
@@ -141,7 +145,10 @@ extern "C" fn rust_main() -> ! {
     }
 
     // 所有用户程序执行完毕，关机
-    tg_sbi::shutdown(false)
+    loop {
+        core::hint::spin_loop();
+    }
+    // tg_sbi::shutdown(false)
 }
 
 // ========== panic 处理 ==========
@@ -213,13 +220,7 @@ mod impls {
 
     /// IO 系统调用实现：处理 write 系统调用
     impl tg_syscall::IO for SyscallContext {
-        fn write(
-            &self,
-            _caller: tg_syscall::Caller,
-            fd: usize,
-            buf: usize,
-            count: usize,
-        ) -> isize {
+        fn write(&self, _caller: tg_syscall::Caller, fd: usize, buf: usize, count: usize) -> isize {
             match fd {
                 // 标准输出和调试输出：将缓冲区内容打印到控制台
                 STDOUT | STDDEBUG => {
