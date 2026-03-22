@@ -29,6 +29,7 @@
 
 // 进程管理模块：定义 Process 结构体，包含地址空间和上下文
 mod process;
+mod tetris;
 
 // 引入控制台输出宏（print! / println!），由 tg_console 库提供
 #[macro_use]
@@ -114,6 +115,9 @@ unsafe extern "C" fn _start() -> ! {
 
 // 物理内存容量 = 24 MiB（QEMU virt 平台的 RAM 大小）
 const MEMORY: usize = 24 << 20;
+const UART_MMIO_BASE: usize = 0x1000_0000;
+const VIRTIO_GPU_MMIO_BASE: usize = 0x1000_1000;
+const RUN_TETRIS_ONLY: bool = true;
 
 // 异界传送门所在虚页：虚拟地址空间的最高页
 // 传送门同时映射到内核和所有用户地址空间的相同虚拟地址，
@@ -175,6 +179,11 @@ extern "C" fn rust_main() -> ! {
     assert!(portal_layout.size() < 1 << Sv39::PAGE_BITS);
     // 第五步：建立内核地址空间（恒等映射 + 传送门映射）
     let mut ks = kernel_space(layout, MEMORY, portal_ptr as _);
+
+    if RUN_TETRIS_ONLY {
+        tetris::run();
+    }
+
     let portal_idx = PROTAL_TRANSIT.index_in(Sv39::MAX_LEVEL);
     // 第六步：加载用户程序
     // 解析每个 ELF 文件，创建独立地址空间，映射传送门
@@ -311,8 +320,8 @@ fn kernel_space(
         log::info!("{region}");
         use tg_linker::KernelRegionTitle::*;
         let flags = match region.title {
-            Text => "X_RV",    // 代码段：可执行、可读
-            Rodata => "__RV",  // 只读数据段：只读
+            Text => "X_RV",        // 代码段：可执行、可读
+            Rodata => "__RV",      // 只读数据段：只读
             Data | Boot => "_WRV", // 数据段/启动段：可读写
         };
         let s = VAddr::<Sv39>::new(region.range.start);
@@ -336,6 +345,22 @@ fn kernel_space(
         PPN::new(s.floor().val()),
         build_flags("_WRV"),
     );
+
+    // 映射 UART MMIO 页，供内核 read(STDIN) 轮询输入。
+    let uart = VAddr::<Sv39>::new(UART_MMIO_BASE);
+    space.map_extern(
+        uart.floor()..uart.floor() + 1,
+        PPN::new(uart.floor().val()),
+        build_flags("_WRV"),
+    );
+
+    let gpu = VAddr::<Sv39>::new(VIRTIO_GPU_MMIO_BASE);
+    space.map_extern(
+        gpu.floor()..gpu.floor() + 1,
+        PPN::new(gpu.floor().val()),
+        build_flags("_WRV"),
+    );
+
     // 映射异界传送门到虚拟地址空间最高页
     // 标志位 "__G_XWRV" 表示全局、可执行、可读写、有效
     space.map_extern(
@@ -459,6 +484,39 @@ mod impls {
     /// **与前几章的关键区别**：用户传入的 `buf` 是虚拟地址，
     /// 需要通过 `address_space.translate()` 翻译为物理地址才能访问。
     impl IO for SyscallContext {
+        fn read(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
+            const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
+            const UART_BASE: usize = 0x1000_0000;
+            const LSR: usize = UART_BASE + 5;
+            if fd != STDIN {
+                log::error!("unsupported fd: {fd}");
+                return -1;
+            }
+            if count == 0 {
+                return 0;
+            }
+            if let Some(mut ptr) = unsafe { PROCESSES.get_mut() }
+                .get_mut(caller.entity)
+                .unwrap()
+                .address_space
+                .translate::<u8>(VAddr::new(buf), WRITABLE)
+            {
+                // SAFETY: QEMU virt UART MMIO polling in kernel.
+                unsafe {
+                    let lsr = (LSR as *const u8).read_volatile();
+                    if (lsr & 0x01) == 0 {
+                        return -2;
+                    }
+                    let c = (UART_BASE as *const u8).read_volatile();
+                    *ptr.as_mut() = c;
+                    1
+                }
+            } else {
+                log::error!("ptr not writable");
+                -1
+            }
+        }
+
         fn write(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
             match fd {
                 STDOUT | STDDEBUG => {
@@ -563,13 +621,7 @@ mod impls {
     /// - 使用 translate() 方法进行地址翻译和权限检查
     impl Trace for SyscallContext {
         #[inline]
-        fn trace(
-            &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
-        ) -> isize {
+        fn trace(&self, _caller: Caller, _trace_request: usize, _id: usize, _data: usize) -> isize {
             tg_console::log::info!("trace: not implemented");
             -1
         }
