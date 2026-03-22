@@ -27,6 +27,9 @@
 #![cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 
 // 任务管理模块：定义任务控制块（TCB）和调度事件
+#[cfg(target_arch = "riscv64")]
+mod alloc;
+mod snake;
 mod task;
 
 // 引入控制台输出宏（print! / println!），由 tg_console 库提供
@@ -53,6 +56,7 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
 // 最大支持的应用程序数量
 const APP_CAPACITY: usize = 32;
+const RUN_SNAKE_ONLY: bool = true;
 
 // 定义内核入口点：分配 (APP_CAPACITY + 2) * 8 KiB = 272 KiB 的内核栈
 // 比第二章更大，因为需要同时容纳多个任务的内核上下文。
@@ -102,6 +106,14 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_scheduling(&SyscallContext);
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_trace(&SyscallContext);
+
+    if RUN_SNAKE_ONLY {
+        log::info!("skip ch3 user apps, start snake directly");
+        snake::run();
+    }
+
+    // 先激活 GPU 扫描输出，避免窗口提示“Display output is not active”。
+    snake::activate_display();
 
     // 第四步：初始化任务控制块数组，加载所有用户程序
     let mut tcbs = [TaskControlBlock::ZERO; APP_CAPACITY];
@@ -193,8 +205,8 @@ extern "C" fn rust_main() -> ! {
         i = (i + 1) % index_mod;
     }
 
-    // 所有用户程序执行完毕，关机
-    tg_sbi::shutdown(false)
+    // 所有用户程序执行完毕，进入贪吃蛇小游戏
+    snake::run()
 }
 
 // ========== panic 处理 ==========
@@ -273,12 +285,7 @@ mod impls {
     /// QEMU virt 平台的时钟频率为 12.5 MHz（10000/125 = 80 ns/tick）。
     impl Clock for SyscallContext {
         #[inline]
-        fn clock_gettime(
-            &self,
-            _caller: Caller,
-            clock_id: ClockId,
-            tp: usize,
-        ) -> isize {
+        fn clock_gettime(&self, _caller: Caller, clock_id: ClockId, tp: usize) -> isize {
             match clock_id {
                 ClockId::CLOCK_MONOTONIC => {
                     // 将 RISC-V time 寄存器的值转换为纳秒
@@ -303,13 +310,7 @@ mod impls {
     /// - 查询系统调用计数（trace_request=2）
     impl Trace for SyscallContext {
         #[inline]
-        fn trace(
-            &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
-        ) -> isize {
+        fn trace(&self, _caller: Caller, _trace_request: usize, _id: usize, _data: usize) -> isize {
             tg_console::log::info!("trace: not implemented");
             -1
         }
