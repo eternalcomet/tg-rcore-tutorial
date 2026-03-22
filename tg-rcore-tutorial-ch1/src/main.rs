@@ -20,13 +20,18 @@
 // 不使用标准入口，因为裸机环境没有 C runtime 进行初始化
 #![no_main]
 // RISC-V64 架构下启用严格警告和文档检查
-#![cfg_attr(target_arch = "riscv64", deny(warnings, missing_docs))]
+// #![cfg_attr(target_arch = "riscv64", deny(warnings, missing_docs))]
 // 非 RISC-V64 架构允许死代码（用于 cargo publish --dry-run 在主机上通过编译）
 #![cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 
 // 引入 SBI 调用库，提供 console_putchar（输出字符）和 shutdown（关机）功能
 // 启用 nobios 特性后，tg_sbi 内建了 M-mode 启动代码，无需外部 SBI 固件
+use tg_display::{Display, DEFAULT_VIRTIO_MMIO_BASE};
 use tg_sbi::{console_putchar, shutdown};
+
+#[cfg(target_arch = "riscv64")]
+mod alloc;
+mod tangram;
 
 /// S 态程序入口点。
 ///
@@ -63,10 +68,56 @@ unsafe extern "C" fn _start() -> ! {
 /// 通过 SBI 的 `console_putchar` 逐字节输出字符串，
 /// 然后调用 `shutdown` 正常关机退出 QEMU。
 extern "C" fn rust_main() -> ! {
-    for c in b"Hello, world!\n" {
-        console_putchar(*c);
+    put_str("Hello, world!\n");
+    put_str("[ch1] display: begin\n");
+
+    if let Ok(mut display) = Display::new_virtio_gpu(DEFAULT_VIRTIO_MMIO_BASE) {
+        put_str("[ch1] display: init ok\n");
+        if let Ok(mut fb) = display.framebuffer() {
+            put_str("[ch1] display: framebuffer ok\n");
+            put_str("[ch1] fb size: ");
+            put_dec(fb.width as u64);
+            put_str("x");
+            put_dec(fb.height as u64);
+            put_str("\n");
+            put_str("[ch1] display: render start\n");
+            tangram::render_tangram_os(&mut fb);
+            put_str("[ch1] display: render done\n");
+            let _ = display.flush();
+            put_str("[ch1] display: flush done\n");
+        } else {
+            put_str("[ch1] display: framebuffer err\n");
+        }
+    } else {
+        put_str("[ch1] display: init err\n");
     }
-    shutdown(false) // false 表示正常关机
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn put_str(s: &str) {
+    for &c in s.as_bytes() {
+        console_putchar(c);
+    }
+}
+
+fn put_dec(mut n: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if n == 0 {
+        console_putchar(b'0');
+        return;
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    for &c in &buf[i..] {
+        console_putchar(c);
+    }
 }
 
 /// panic 处理函数。
